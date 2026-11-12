@@ -1,8 +1,62 @@
-FROM registry.access.redhat.com/ubi8/ubi-minimal:8.6
+ARG GO_IMAGE=golang:1
 
-ARG TARGETARCH
+FROM ${GO_IMAGE} AS build
 
-ARG RELEASE
+ARG TARGETARCH=amd64
+ARG RELEASE=RELEASE.2022-11-17T23-20-09Z
+ARG COMMIT=a22b4adf4c5cc3e4db13fe92da683ef1ce45cd5a
+# Modules bumped to their latest release before compiling (fixes Go dependency CVEs).
+ARG DEP_BUMPS="google.golang.org/grpc google.golang.org/api cloud.google.com/go/compute cloud.google.com/go/compute/metadata cloud.google.com/go/auth cloud.google.com/go/storage google.golang.org/protobuf golang.org/x/net golang.org/x/crypto golang.org/x/text golang.org/x/sys golang.org/x/oauth2 golang.org/x/image gopkg.in/yaml.v2 gopkg.in/yaml.v3 github.com/golang-jwt/jwt/v4 github.com/coredns/coredns github.com/lestrrat-go/jwx github.com/klauspost/compress go.etcd.io/etcd/api/v3 go.etcd.io/etcd/client/pkg/v3 go.etcd.io/etcd/client/v3 github.com/go-jose/go-jose/v4 go.mongodb.org/mongo-driver github.com/Azure/go-ntlmssp github.com/buger/jsonparser github.com/apache/thrift github.com/eclipse/paho.mqtt.golang"
+
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-trimpath
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Bump dependencies, then make go.mod/go.sum consistent.
+RUN set -eux; \
+    for m in ${DEP_BUMPS}; do \
+      case "${m}" in *@*) t="${m}";; *) t="${m}@latest";; esac; \
+      go get "${t}" || echo "WARN: could not bump ${m}"; \
+    done; \
+    go mod tidy -e
+
+RUN set -eux; \
+    VERSION="${RELEASE#RELEASE.}"; \
+    GOOS=linux GOARCH=${TARGETARCH} go build -o /out/minio \
+      -ldflags "-s -w \
+        -X github.com/minio/minio/cmd.Version=${VERSION} \
+        -X github.com/minio/minio/cmd.CopyrightYear=${VERSION%%-*} \
+        -X github.com/minio/minio/cmd.ReleaseTag=${RELEASE} \
+        -X github.com/minio/minio/cmd.CommitID=${COMMIT} \
+        -X github.com/minio/minio/cmd.ShortCommitID=$(echo ${COMMIT} | cut -c1-12)" \
+      .; \
+    /out/minio --version
+
+# Vulnerability report for the binary that will ship (does not fail the build).
+RUN go install golang.org/x/vuln/cmd/govulncheck@latest && \
+    (/go/bin/govulncheck -mode=binary /out/minio || true)
+
+# Static curl (no krb5/gssapi dependency) for the compose healthcheck, pinned by
+# sha256. Upstream publishes amd64 only; other architectures ship without curl.
+ARG STATIC_CURL_TAG=v8.21.0
+ARG STATIC_CURL_SHA256_AMD64=e45ae1805ceb3f816e9768fbbaba05d98a2dc9c5577f66395f37660941d88e19
+RUN set -eux; \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+      curl -fsSL -o /out/curl "https://github.com/moparisthebest/static-curl/releases/download/${STATIC_CURL_TAG}/curl-amd64"; \
+      echo "${STATIC_CURL_SHA256_AMD64}  /out/curl" | sha256sum -c -; \
+      chmod 0755 /out/curl; \
+    else \
+      echo "static curl not available for ${TARGETARCH}, skipping"; \
+      touch /out/curl; \
+    fi
+
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+
+ARG RELEASE=RELEASE.2022-11-17T23-20-09Z
 
 LABEL name="MinIO" \
       vendor="MinIO Inc <dev@min.io>" \
@@ -18,30 +72,17 @@ ENV MINIO_ACCESS_KEY_FILE=access_key \
     MINIO_ROOT_PASSWORD_FILE=secret_key \
     MINIO_KMS_SECRET_KEY_FILE=kms_master_key \
     MINIO_UPDATE_MINISIGN_PUBKEY="RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav" \
-    MINIO_CONFIG_ENV_FILE=config.env \
-    PATH=/opt/bin:$PATH
+    MINIO_CONFIG_ENV_FILE=config.env
 
-COPY dockerscripts/verify-minio.sh /usr/bin/verify-minio.sh
-COPY dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+# ubi-micro has no package manager and only a handful of packages, which keeps
+# the OS CVE surface minimal (pull with --pull to get the newest base).
+# Note: the optional MINIO_USERNAME/MINIO_GROUPNAME user switch in
+# docker-entrypoint.sh needs groupadd/setpriv and is not available; use "user:".
+COPY --chmod=0755 dockerscripts/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
 COPY CREDITS /licenses/CREDITS
 COPY LICENSE /licenses/LICENSE
-
-RUN \
-     microdnf clean all && \
-     microdnf update --nodocs && \
-     microdnf install curl ca-certificates shadow-utils util-linux --nodocs && \
-     rpm -Uvh https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm && \
-     microdnf install minisign --nodocs && \
-     mkdir -p /opt/bin && chmod -R 777 /opt/bin && \
-     curl -s -q https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive/minio.${RELEASE} -o /opt/bin/minio && \
-     curl -s -q https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive/minio.${RELEASE}.sha256sum -o /opt/bin/minio.sha256sum && \
-     curl -s -q https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive/minio.${RELEASE}.minisig -o /opt/bin/minio.minisig && \
-     microdnf clean all && \
-     chmod +x /opt/bin/minio && \
-     chmod +x /usr/bin/docker-entrypoint.sh && \
-     chmod +x /usr/bin/verify-minio.sh && \
-     /usr/bin/verify-minio.sh && \
-     microdnf clean all
+COPY --from=build --chmod=0755 /out/minio /usr/bin/minio
+COPY --from=build --chmod=0755 /out/curl /usr/bin/curl
 
 EXPOSE 9000
 
